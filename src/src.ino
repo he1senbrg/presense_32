@@ -7,21 +7,22 @@
 #include <map>
 #include <iostream>
 #include "time.h"
-#include "mbedtls/md.h" // HMAC and SHA256 library for ESP32
+#include "mbedtls/md.h"
+#include <esp_wpa2.h>
 
 HTTPClient http;
 WiFiClientSecure client;
 
 // Time-related variables
-const char* ntpServer = "pool.ntp.org";
+const char* timeApiUrl = "http://worldtimeapi.org/api/timezone/Asia/Kolkata";
 const long gmtOffset_sec = 19800;
 const int daylightOffset_sec = 0;
 struct tm timeinfo;
 char dateStr[11];
 
-// Network-related variables
 const char* ssid = "";
 const char* password = "";
+const char* username = "";
 const char* graphql_endpoint_main = "https://root.shuttleapp.rs";
 const char* secretKey = "";
 
@@ -35,29 +36,45 @@ std::map<String, String> hmacMap;
 // Timer for channel hopping
 esp_timer_handle_t channelHop_timer;
 
+uint8_t newMACAddress[] = {0xD0, 0xAB, 0xD5, 0x22, 0xBE, 0x56};
+
 // Setup function
 void setup() {
     Serial.begin(115200);
     client.setInsecure();
 
-    fetchMemberData();
+    WiFi.mode(WIFI_STA); 
 
-    // Sync with NTP time server
-    while (!getLocalTime(&timeinfo)) {
-        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-        Serial.print("+");
-        delay(500);
+    Serial.print("DEFAULT MAC Address: ");
+    readMacAddress();
+
+    esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, &newMACAddress[0]);
+    if (err == ESP_OK) {
+        Serial.println("Mac Address Changed");
     }
 
-    Serial.println("\nDate:");
-    strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
-    Serial.println(dateStr);
+    Serial.print("Spoofed MAC Address: ");
+    readMacAddress();
+    
+    // WPA2 Enterprise PEAP setup
+    esp_wifi_sta_wpa2_ent_set_identity((uint8_t*)username, strlen(username));
+    esp_wifi_sta_wpa2_ent_set_username((uint8_t*)username, strlen(username));
+    esp_wifi_sta_wpa2_ent_set_password((uint8_t*)password, strlen(password));
+    
+    esp_wifi_sta_wpa2_ent_enable(); 
+
+    fetchMemberData();
+
+    struct tm currentTime = getTimeInfo();
+    strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &currentTime);
+    Serial.println("\nDate: " + String(dateStr));
 
     createHMACMap();
 
     // Set the WiFi chip to promiscuous mode aka monitor mode
     delay(10);
     WiFi.mode(WIFI_STA);
+
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous_rx_cb(&sniffer_callback);
     esp_wifi_set_promiscuous(true);
@@ -74,13 +91,61 @@ void setup() {
 }
 
 void loop() {
-    delay(60000);
+    delay(90000);
     sendToServer();
+}
+
+struct tm getTimeInfo() {
+    struct tm timeInfo = {0};
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi is not connected");
+        return timeInfo;
+    }
+
+    HTTPClient http;
+    http.begin(timeApiUrl);
+    int httpResponseCode = http.GET();
+
+    while (httpResponseCode <= 0) {
+        httpResponseCode = http.GET();
+        Serial.println("Retrying to fetch time");
+        delay(1000);
+    }
+    
+    if (httpResponseCode == 200) {
+        String response = http.getString();
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, response);
+
+        const char* dateTime = doc["datetime"];
+        Serial.println(dateTime);
+        strptime(dateTime, "%Y-%m-%dT%H:%M:%S", &timeInfo);
+
+        http.end();
+    } else {
+        Serial.println("Failed to fetch time : " + String(httpResponseCode));
+        http.end();
+    }
+
+    return timeInfo;
+}
+
+void readMacAddress(){
+    uint8_t baseMac[6];
+    esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, baseMac);
+    if (ret == ESP_OK) {
+        Serial.printf("%02x:%02x:%02x:%02x:%02x:%02x\n",
+        baseMac[0], baseMac[1], baseMac[2],
+        baseMac[3], baseMac[4], baseMac[5]);
+    } else {
+        Serial.println("Failed to read MAC address");
+    }
 }
 
 // Function to fetch member data from server and create a map of mac addresses and member IDs
 void fetchMemberData() {
-    WiFi.begin(ssid, password);
+    WiFi.begin(ssid);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print("-");
@@ -103,6 +168,7 @@ void fetchMemberData() {
 
     for (JsonVariant member : memberData["data"]["getMember"].as<JsonArray>()) {
         String macAddress = member["macaddress"].as<String>();
+        macAddress.toLowerCase();
         String memberId = member["id"].as<String>();
         memberMap[macAddress] = memberId;
     }
@@ -159,10 +225,11 @@ void sendToServer() {
     disablePromiscuousMode();
     delay(10);
 
-    WiFi.begin(ssid, password);
+    
     while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
+        WiFi.begin(ssid);
         Serial.print("-");
+        delay(10000);
     }
 
     Serial.println("");
